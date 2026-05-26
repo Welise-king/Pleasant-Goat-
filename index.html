@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>喜羊羊大王</title>
+    <style>
+        :root {
+            --bg: #000000;
+            --text: #fff;
+        }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #000;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            user-select: none;
+            touch-action: manipulation;
+        }
+        #canvas3d {
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+            pointer-events: none;
+        }
+        /* 手势状态指示器 - 保留在顶部 */
+        #gestureIndicator {
+            position: fixed;
+            top: 25px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 20;
+            padding: 12px 28px;
+            border-radius: 40px;
+            background: rgba(0, 0, 0, 0.55);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            color: #fff;
+            font-weight: 600;
+            font-size: 15px;
+            letter-spacing: 1px;
+            pointer-events: none;
+            transition: all 0.3s ease;
+            text-shadow: 0 0 15px rgba(255, 255, 255, 0.4);
+        }
+        #gestureIndicator.sphere {
+            border-color: #ffaa30;
+            box-shadow: 0 0 35px rgba(255, 170, 48, 0.55);
+            color: #ffe0b3;
+        }
+        #gestureIndicator.scatter {
+            border-color: #64d8ff;
+            box-shadow: 0 0 35px rgba(100, 216, 255, 0.45);
+            color: #b3e8ff;
+        }
+        #gestureIndicator.heart {
+            border-color: #ff4d7a;
+            box-shadow: 0 0 35px rgba(255, 77, 122, 0.5);
+            color: #ffb3c9;
+        }
+        #gestureIndicator.stream {
+            border-color: #00ffaa;
+            box-shadow: 0 0 35px rgba(0, 255, 170, 0.55);
+            color: #b3ffe0;
+        }
+        .gesture-emoji {
+            font-size: 22px;
+            margin-right: 8px;
+            vertical-align: -3px;
+        }
+
+        /* 隐藏摄像头预览窗口 */
+        #cameraPreview {
+            display: none;
+        }
+
+        /* 隐藏左侧控制面板 */
+        #controlPanel {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas3d"></div>
+    <div id="gestureIndicator">
+        <span class="gesture-emoji">✨</span> 散开流动
+    </div>
+    <!-- 摄像头视频元素仍然需要，但隐藏界面 -->
+    <div id="cameraPreview" style="display:none">
+        <video id="webcamVideo" autoplay playsinline muted></video>
+        <div class="cam-label">📷 手势识别</div>
+    </div>
+    <!-- 控制面板隐藏，手势功能仍通过代码中的逻辑运行 -->
+    <div id="controlPanel" style="display:none">
+        <button class="shape-btn" data-shape="scatter" id="btnScatter">💫 散开</button>
+        <button class="shape-btn" data-shape="sphere" id="btnSphere">🔮 球状</button>
+        <button class="shape-btn" data-shape="heart" id="btnHeart">❤️ 爱心</button>
+        <button class="shape-btn" data-shape="stream" id="btnStream">🌊 波浪流</button>
+        <input type="color" id="colorPicker" value="#ff4d7a">
+        <input type="range" id="particleSlider" min="800" max="7000" value="3000" step="200">
+        <div id="particleCountDisplay">3000 粒子</div>
+    </div>
+
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // ==================== DOM 引用 ====================
+        const container = document.getElementById('canvas3d');
+        const gestureEl = document.getElementById('gestureIndicator');
+        const videoEl = document.getElementById('webcamVideo');
+        // 即使UI隐藏，我们仍然获取按钮引用以保证代码逻辑不报错
+        const btnScatter = document.getElementById('btnScatter');
+        const btnSphere = document.getElementById('btnSphere');
+        const btnHeart = document.getElementById('btnHeart');
+        const btnStream = document.getElementById('btnStream');
+        const colorPicker = document.getElementById('colorPicker');
+        const particleSlider = document.getElementById('particleSlider');
+        const countDisplay = document.getElementById('particleCountDisplay');
+        const allBtns = [btnScatter, btnSphere, btnHeart, btnStream].filter(b => b);
+
+        // ==================== 全局状态 ====================
+        let particleCount = 3000;
+        let particleColor = new THREE.Color('#ff4d7a');
+        let currentShape = 'scatter'; // 'scatter' | 'sphere' | 'heart' | 'stream'
+        let manualOverrideUntil = 0;
+        let detectedGesture = null;
+        let gestureStable = 0;
+        const STABLE_FRAMES = 3;
+        let previousGuess = null;
+
+        // 粒子目标数组
+        let scatterPositions, spherePositions, heartPositions;
+        let currentTargets;
+
+        // 手指跟随数据
+        let fingerTipPos = new THREE.Vector3(0, 0, 8);
+        let fingerPrevPos = new THREE.Vector3(0, 0, 8);
+        let fingerDirection = new THREE.Vector3(0, 0, 1);
+        let fingerVelocity = new THREE.Vector3();
+        let streamOffsets = null;
+
+        // ==================== Three.js 场景 ====================
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.5, 120);
+        camera.position.set(0, 0.5, 28);
+        camera.lookAt(0, -0.5, 0);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setClearColor(0x000000, 1);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        container.appendChild(renderer.domElement);
+
+        const particleGroup = new THREE.Group();
+        scene.add(particleGroup);
+
+        // ==================== 发光纹理 ====================
+        function createGlowTexture(hexColor) {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const half = size / 2;
+            const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+            grad.addColorStop(0, '#ffffff');
+            grad.addColorStop(0.05, 'rgba(255,255,255,0.95)');
+            grad.addColorStop(0.16, hexColor);
+            grad.addColorStop(0.42, 'rgba(255,140,100,0.28)');
+            grad.addColorStop(0.7, 'rgba(60,20,50,0.04)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, size, size);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            return tex;
+        }
+        let glowTex = createGlowTexture('#ff4d7a');
+
+        // ==================== 粒子系统 ====================
+        let pointsGeo, pointsMat, pointsObj;
+
+        function createParticles(count) {
+            if (pointsObj) { particleGroup.remove(pointsObj); pointsGeo?.dispose(); pointsMat?.dispose(); }
+            pointsGeo = new THREE.BufferGeometry();
+            const posArr = new Float32Array(count * 3);
+            const colArr = new Float32Array(count * 3);
+            const sizeArr = new Float32Array(count);
+            for (let i = 0; i < count; i++) {
+                const th = Math.random() * Math.PI * 2;
+                const ph = Math.acos(2 * Math.random() - 1);
+                const r = 7 + Math.random() * 14;
+                posArr[i * 3] = r * Math.sin(ph) * Math.cos(th);
+                posArr[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+                posArr[i * 3 + 2] = r * Math.cos(ph);
+                const shade = 0.7 + Math.random() * 0.3;
+                colArr[i * 3] = particleColor.r * shade;
+                colArr[i * 3 + 1] = particleColor.g * shade;
+                colArr[i * 3 + 2] = particleColor.b * shade;
+                sizeArr[i] = 0.18 + Math.random() * 0.65;
+            }
+            pointsGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+            pointsGeo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+            pointsGeo.setAttribute('size', new THREE.BufferAttribute(sizeArr, 1));
+            pointsMat = new THREE.PointsMaterial({
+                size: 0.6,
+                map: glowTex,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                depthTest: true,
+                vertexColors: true,
+                sizeAttenuation: true,
+                opacity: 0.9,
+                transparent: true,
+            });
+            pointsObj = new THREE.Points(pointsGeo, pointsMat);
+            particleGroup.add(pointsObj);
+            scatterPositions = genScatter(count);
+            spherePositions = genSphere(count);
+            heartPositions = genHeart(count);
+            currentTargets = scatterPositions;
+            setPositionsDirect(scatterPositions);
+            generateStreamOffsets(count);
+        }
+
+        function setPositionsDirect(targetArr) {
+            const attr = pointsGeo.getAttribute('position');
+            const arr = attr.array;
+            for (let i = 0; i < particleCount; i++) {
+                arr[i * 3] = targetArr[i * 3];
+                arr[i * 3 + 1] = targetArr[i * 3 + 1];
+                arr[i * 3 + 2] = targetArr[i * 3 + 2];
+            }
+            attr.needsUpdate = true;
+        }
+
+        function updateColors() {
+            const colAttr = pointsGeo.getAttribute('color');
+            const arr = colAttr.array;
+            for (let i = 0; i < particleCount; i++) {
+                const s = 0.7 + Math.random() * 0.3;
+                arr[i * 3] = particleColor.r * s;
+                arr[i * 3 + 1] = particleColor.g * s;
+                arr[i * 3 + 2] = particleColor.b * s;
+            }
+            colAttr.needsUpdate = true;
+            const hex = '#' + particleColor.getHexString();
+            glowTex.dispose();
+            glowTex = createGlowTexture(hex);
+            pointsMat.map = glowTex;
+            pointsMat.needsUpdate = true;
+        }
+
+        function rebuildSystem(newCount) {
+            particleCount = newCount;
+            createParticles(particleCount);
+            updateColors();
+            if (currentShape === 'scatter') currentTargets = scatterPositions;
+            else if (currentShape === 'sphere') currentTargets = spherePositions;
+            else if (currentShape === 'heart') currentTargets = heartPositions;
+            else if (currentShape === 'stream') currentTargets = null;
+            if (currentTargets) setPositionsDirect(currentTargets);
+        }
+
+        function generateStreamOffsets(count) {
+            streamOffsets = new Float32Array(count * 4);
+            for (let i = 0; i < count; i++) {
+                streamOffsets[i * 4] = Math.random() * 2.2;
+                streamOffsets[i * 4 + 1] = Math.random() * Math.PI * 2;
+                streamOffsets[i * 4 + 2] = (Math.random() - 0.2) * 9;
+                streamOffsets[i * 4 + 3] = Math.random() * 100;
+            }
+        }
+
+        function genScatter(n) {
+            const arr = new Float32Array(n * 3);
+            for (let i = 0; i < n; i++) {
+                const th = Math.random() * Math.PI * 2;
+                const ph = Math.acos(2 * Math.random() - 1);
+                const r = 6 + Math.random() * 14;
+                arr[i * 3] = r * Math.sin(ph) * Math.cos(th);
+                arr[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+                arr[i * 3 + 2] = r * Math.cos(ph);
+            }
+            return arr;
+        }
+
+        function genSphere(n) {
+            const arr = new Float32Array(n * 3);
+            const shellCount = Math.floor(n * 0.5);
+            const innerCount = Math.floor(n * 0.28);
+            const outerCount = n - shellCount - innerCount;
+            const sphereRadius = 7.5;
+            const shellThickness = 1.2;
+            for (let i = 0; i < shellCount; i++) {
+                const th = Math.random() * Math.PI * 2;
+                const ph = Math.acos(2 * Math.random() - 1);
+                const r = sphereRadius + (Math.random() - 0.5) * shellThickness;
+                arr[i * 3] = r * Math.sin(ph) * Math.cos(th);
+                arr[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+                arr[i * 3 + 2] = r * Math.cos(ph);
+            }
+            for (let i = 0; i < innerCount; i++) {
+                const th = Math.random() * Math.PI * 2;
+                const ph = Math.acos(2 * Math.random() - 1);
+                const r = 1.2 + Math.random() * (sphereRadius - shellThickness / 2 - 1.2);
+                arr[(shellCount + i) * 3] = r * Math.sin(ph) * Math.cos(th);
+                arr[(shellCount + i) * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+                arr[(shellCount + i) * 3 + 2] = r * Math.cos(ph);
+            }
+            for (let i = 0; i < outerCount; i++) {
+                const th = Math.random() * Math.PI * 2;
+                const ph = Math.acos(2 * Math.random() - 1);
+                const r = sphereRadius + shellThickness / 2 + Math.random() * 4.5;
+                const idx = shellCount + innerCount + i;
+                arr[idx * 3] = r * Math.sin(ph) * Math.cos(th);
+                arr[idx * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+                arr[idx * 3 + 2] = r * Math.cos(ph);
+            }
+            return arr;
+        }
+
+        function genHeart(n) {
+            const arr = new Float32Array(n * 3);
+            const scale = 0.44;
+            const contourCount = Math.floor(n * 0.55);
+            const innerCount = Math.floor(n * 0.32);
+            const depthCount = n - contourCount - innerCount;
+            for (let i = 0; i < contourCount; i++) {
+                const t = (i / contourCount) * Math.PI * 2;
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+                const z = (Math.random() - 0.5) * 3.5;
+                arr[i * 3] = x * scale;
+                arr[i * 3 + 1] = y * scale;
+                arr[i * 3 + 2] = z;
+            }
+            for (let i = 0; i < innerCount; i++) {
+                let px, py;
+                if (Math.random() < 0.7) {
+                    px = (Math.random() - 0.5) * 10;
+                    py = (Math.random() - 0.5) * 9;
+                } else {
+                    px = (Math.random() - 0.5) * 6;
+                    py = (Math.random() - 0.5) * 8;
+                }
+                const z = (Math.random() - 0.5) * 3;
+                arr[(contourCount + i) * 3] = px;
+                arr[(contourCount + i) * 3 + 1] = py;
+                arr[(contourCount + i) * 3 + 2] = z;
+            }
+            for (let i = 0; i < depthCount; i++) {
+                const t = Math.random() * Math.PI * 2;
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+                const z = (Math.random() - 0.5) * 4.5;
+                const idx = contourCount + innerCount + i;
+                arr[idx * 3] = x * scale * (0.8 + Math.random() * 0.4);
+                arr[idx * 3 + 1] = y * scale * (0.8 + Math.random() * 0.4);
+                arr[idx * 3 + 2] = z;
+            }
+            return arr;
+        }
+
+        // ==================== 手势识别 ====================
+        let hands;
+        function isExtended(lm, tip, pip) {
+            const dy = lm[tip].y - lm[pip].y;
+            return dy < -0.055;
+        }
+        function classify(lm) {
+            if (!lm || lm.length < 21) return null;
+            const index = isExtended(lm, 8, 6);
+            const middle = isExtended(lm, 12, 10);
+            const ring = isExtended(lm, 16, 14);
+            const pinky = isExtended(lm, 20, 18);
+            const thumb = isExtended(lm, 4, 2);
+            const count = [index, middle, ring, pinky, thumb].filter(v => v).length;
+            if (index && !middle && !ring && !pinky && count <= 2) return 'point';
+            if (!index && !middle && count <= 1) return 'fist';
+            if (count >= 4) return 'open';
+            if (index && middle && !ring && !pinky && count <= 3) return 'peace';
+            return null;
+        }
+        function updateFingerPosition(landmarks) {
+            if (!landmarks || landmarks.length < 21) return;
+            const tip = landmarks[8];
+            const base = landmarks[5];
+            const x = (tip.x - 0.5) * 18;
+            const y = -(tip.y - 0.5) * 12;
+            const z = 6 + tip.z * 8;
+            fingerPrevPos.copy(fingerTipPos);
+            fingerTipPos.set(x, y, z);
+            fingerVelocity.subVectors(fingerTipPos, fingerPrevPos);
+            const bx = (base.x - 0.5) * 18;
+            const by = -(base.y - 0.5) * 12;
+            const bz = 6 + base.z * 8;
+            const dir = new THREE.Vector3(x - bx, y - by, z - bz);
+            if (dir.length() > 0.01) fingerDirection.copy(dir).normalize();
+        }
+        function onResults(results) {
+            if (results.multiHandLandmarks?.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                const gesture = classify(lm);
+                updateFingerPosition(lm);
+                if (gesture !== detectedGesture) {
+                    if (gesture === previousGuess) {
+                        gestureStable++;
+                    } else {
+                        gestureStable = 1;
+                        previousGuess = gesture;
+                    }
+                    if (gestureStable >= STABLE_FRAMES) {
+                        detectedGesture = gesture;
+                        gestureStable = 0;
+                        previousGuess = null;
+                        if (Date.now() >= manualOverrideUntil) {
+                            switch (gesture) {
+                                case 'point': setShape('stream'); break;
+                                case 'fist': setShape('sphere'); break;
+                                case 'open': setShape('scatter'); break;
+                                case 'peace': setShape('heart'); break;
+                            }
+                        }
+                    }
+                } else {
+                    gestureStable = Math.min(gestureStable + 1, 10);
+                }
+                updateIndicator(gesture);
+            } else {
+                gestureStable = 0;
+                previousGuess = null;
+                updateIndicator(null);
+            }
+        }
+        function updateIndicator(gesture) {
+            const el = gestureEl;
+            el.classList.remove('sphere', 'scatter', 'heart', 'stream');
+            const map = {
+                fist: ['✊', '握拳·球状', 'sphere'],
+                open: ['🖐️', '张开·散开', 'scatter'],
+                peace: ['✌️', '比耶·爱心', 'heart'],
+                point: ['☝️', '单指·波浪流', 'stream']
+            };
+            if (gesture && map[gesture]) {
+                const [emoji, text, cls] = map[gesture];
+                el.querySelector('.gesture-emoji').textContent = emoji;
+                el.childNodes[1] && (el.childNodes[1].textContent = ' ' + text);
+                el.classList.add(cls);
+            } else {
+                const def = {
+                    scatter: ['💫', '散开流动', 'scatter'],
+                    sphere: ['🔮', '球状', 'sphere'],
+                    heart: ['❤️', '爱心', 'heart'],
+                    stream: ['🌊', '波浪流', 'stream']
+                };
+                const d = def[currentShape];
+                el.querySelector('.gesture-emoji').textContent = d[0];
+                el.childNodes[1] && (el.childNodes[1].textContent = ' ' + d[1]);
+                el.classList.add(d[2]);
+            }
+        }
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 }, facingMode: 'user' }
+                });
+                videoEl.srcObject = stream;
+                await videoEl.play();
+                initMediaPipe();
+            } catch (e) {
+                console.warn('摄像头不可用:', e.message);
+                gestureEl.querySelector('.gesture-emoji').textContent = '🎮';
+                gestureEl.childNodes[1] && (gestureEl.childNodes[1].textContent = ' 手动模式');
+            }
+        }
+        function initMediaPipe() {
+            if (typeof Hands === 'undefined') return;
+            hands = new Hands({
+                locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+            });
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.75,
+                minTrackingConfidence: 0.6,
+            });
+            hands.onResults(onResults);
+            const cameraUtils = new Camera(videoEl, {
+                onFrame: async () => { if (hands) await hands.send({ image: videoEl }); },
+                width: 640, height: 480
+            });
+            cameraUtils.start();
+        }
+
+        // ==================== 形状切换 ====================
+        function setShape(shape) {
+            if (currentShape === shape) return;
+            currentShape = shape;
+            if (shape === 'scatter') currentTargets = scatterPositions;
+            else if (shape === 'sphere') currentTargets = spherePositions;
+            else if (shape === 'heart') currentTargets = heartPositions;
+            else if (shape === 'stream') currentTargets = null;
+            allBtns.forEach(b => {
+                if (b) b.classList.remove('active');
+            });
+            const map = { scatter: btnScatter, sphere: btnSphere, heart: btnHeart, stream: btnStream };
+            if (map[shape] && map[shape]) map[shape].classList.add('active');
+            updateIndicator(null);
+        }
+
+        // ==================== 动画循环 ====================
+        const clock = new THREE.Clock();
+        let spherePulsePhase = 0;
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1);
+            const time = performance.now() * 0.001;
+            const posAttr = pointsGeo.getAttribute('position');
+            const arr = posAttr.array;
+            const lerp = currentShape === 'stream' ? 0.1 : 0.09;
+
+            if (currentShape === 'scatter') {
+                for (let i = 0; i < particleCount; i++) {
+                    const bx = scatterPositions[i * 3], by = scatterPositions[i * 3 + 1], bz = scatterPositions[i * 3 + 2];
+                    const tx = bx + Math.sin(by * 0.4 + time * 1.5 + i * 0.01) * 1.8;
+                    const ty = by + Math.cos(bx * 0.35 + time * 1.2 + i * 0.013) * 1.6;
+                    const tz = bz + Math.sin(bz * 0.38 + time * 1.0 + i * 0.011) * 1.7;
+                    arr[i * 3] += (tx - arr[i * 3]) * lerp;
+                    arr[i * 3 + 1] += (ty - arr[i * 3 + 1]) * lerp;
+                    arr[i * 3 + 2] += (tz - arr[i * 3 + 2]) * lerp;
+                }
+            } else if (currentShape === 'sphere') {
+                spherePulsePhase += dt * 2.2;
+                const pulseScale = 1 + Math.sin(spherePulsePhase) * 0.06;
+                const sphereRadius = 7.5;
+                for (let i = 0; i < particleCount; i++) {
+                    const sx = spherePositions[i * 3], sy = spherePositions[i * 3 + 1], sz = spherePositions[i * 3 + 2];
+                    const dist = Math.sqrt(sx * sx + sy * sy + sz * sz);
+                    let radialExtra = 0;
+                    if (dist > sphereRadius) radialExtra = (dist - sphereRadius) * Math.sin(spherePulsePhase * 0.7 + i * 0.02) * 0.5;
+                    const effectiveScale = pulseScale + (dist > 0 ? radialExtra / Math.max(dist, 0.01) : 0);
+                    arr[i * 3] += (sx * effectiveScale - arr[i * 3]) * lerp;
+                    arr[i * 3 + 1] += (sy * effectiveScale - arr[i * 3 + 1]) * lerp;
+                    arr[i * 3 + 2] += (sz * effectiveScale - arr[i * 3 + 2]) * lerp;
+                }
+            } else if (currentShape === 'heart') {
+                const maxOffset = 5.5;
+                for (let i = 0; i < particleCount; i++) {
+                    const hx = heartPositions[i * 3], hy = heartPositions[i * 3 + 1], hz = heartPositions[i * 3 + 2];
+                    const len = Math.sqrt(hx * hx + hy * hy + hz * hz) || 1;
+                    const dirX = hx / len, dirY = hy / len, dirZ = hz / len;
+                    let progress = (time * 0.8 + i * 0.01) % 1.0;
+                    if (progress > 0.6) progress = 1 - progress;
+                    const offset = progress * maxOffset;
+                    const tx = hx + dirX * offset;
+                    const ty = hy + dirY * offset;
+                    const tz = hz + dirZ * offset;
+                    arr[i * 3] += (tx - arr[i * 3]) * lerp;
+                    arr[i * 3 + 1] += (ty - arr[i * 3 + 1]) * lerp;
+                    arr[i * 3 + 2] += (tz - arr[i * 3 + 2]) * lerp;
+                }
+            } else if (currentShape === 'stream') {
+                const dir = fingerDirection.clone();
+                if (fingerVelocity.length() > 0.2) {
+                    const velDir = fingerVelocity.clone().normalize();
+                    dir.lerp(velDir, 0.4).normalize();
+                }
+                const up = new THREE.Vector3(0, 1, 0);
+                const perp1 = new THREE.Vector3().crossVectors(dir, up).normalize();
+                if (perp1.length() < 0.1) perp1.set(1, 0, 0).crossVectors(dir, new THREE.Vector3(0, 0, 1)).normalize();
+                const perp2 = new THREE.Vector3().crossVectors(dir, perp1).normalize();
+                const tipPos = fingerTipPos;
+                for (let i = 0; i < particleCount; i++) {
+                    const radius = streamOffsets[i * 4];
+                    const angle = streamOffsets[i * 4 + 1] + time * 1.2;
+                    const along = streamOffsets[i * 4 + 2];
+                    const seed = streamOffsets[i * 4 + 3];
+                    const dynamicAlong = along + Math.sin(time * 2.2 + seed) * 0.5;
+                    const waveHeight = Math.sin(dynamicAlong * 1.8 + time * 3.0) * 2.2;
+                    const tx = tipPos.x + dir.x * dynamicAlong + perp1.x * Math.cos(angle) * radius + perp2.x * Math.sin(angle) * radius + perp2.x * waveHeight;
+                    const ty = tipPos.y + dir.y * dynamicAlong + perp1.y * Math.cos(angle) * radius + perp2.y * Math.sin(angle) * radius + perp2.y * waveHeight;
+                    const tz = tipPos.z + dir.z * dynamicAlong + perp1.z * Math.cos(angle) * radius + perp2.z * Math.sin(angle) * radius + perp2.z * waveHeight;
+                    arr[i * 3] += (tx - arr[i * 3]) * lerp;
+                    arr[i * 3 + 1] += (ty - arr[i * 3 + 1]) * lerp;
+                    arr[i * 3 + 2] += (tz - arr[i * 3 + 2]) * lerp;
+                }
+            }
+            posAttr.needsUpdate = true;
+            if (currentShape !== 'heart') {
+                const rotSpeed = currentShape === 'stream' ? 0.015 : (currentShape === 'scatter' ? 0.11 : 0.07);
+                particleGroup.rotation.y += rotSpeed * dt;
+                particleGroup.rotation.x += rotSpeed * 0.3 * dt;
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+
+        // 键盘快捷键仍然保留，方便无UI时手动切换
+        window.addEventListener('keydown', (e) => {
+            switch (e.key) {
+                case '1': setShape('scatter'); manualOverrideUntil = Date.now() + 3000; break;
+                case '2': setShape('sphere'); manualOverrideUntil = Date.now() + 3000; break;
+                case '3': setShape('heart'); manualOverrideUntil = Date.now() + 3000; break;
+                case '4': setShape('stream'); manualOverrideUntil = Date.now() + 3000; break;
+                case 'r': particleColor.set('#ff4d7a'); if(colorPicker) colorPicker.value = '#ff4d7a'; updateColors(); break;
+                case 'g': particleColor.set('#00e5ff'); if(colorPicker) colorPicker.value = '#00e5ff'; updateColors(); break;
+                case 'p': particleColor.set('#c04dff'); if(colorPicker) colorPicker.value = '#c04dff'; updateColors(); break;
+            }
+        });
+
+        createParticles(particleCount);
+        updateColors();
+        setupCamera();
+        animate();
+    </script>
+</body>
+</html>
